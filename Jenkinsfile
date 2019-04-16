@@ -1,94 +1,63 @@
-import java.text.SimpleDateFormat
-
-def props
-def label = "jenkins-slave-${UUID.randomUUID().toString()}"
-currentBuild.displayName = new SimpleDateFormat("yy.MM.dd").format(new Date()) + "-" + env.BUILD_NUMBER
-
-podTemplate(
-  label: label,
-  namespace: "go-demo-3-build", // Not allowed with declarative
-  serviceAccount: "build",
-  yaml: """
-apiVersion: v1
-kind: Pod
-spec:
-  containers:
-  - name: helm
-    image: vfarcic/helm:2.9.1
-    command: ["cat"]
-    tty: true
-    volumeMounts:
-    - name: build-config
-      mountPath: /etc/config
-  - name: kubectl
-    image: vfarcic/kubectl
-    command: ["cat"]
-    tty: true
-  - name: golang
-    image: golang:1.9
-    command: ["cat"]
-    tty: true
-  volumes:
-  - name: build-config
-    configMap:
-      name: build-config
-"""
-) {
-  node(label) {
-    stage("build") {
-      container("helm") {
-        sh "cp /etc/config/build-config.properties ."
-        props = readProperties interpolate: true, file: "build-config.properties"
+pipeline {
+  agent any
+  environment {
+    ORG = 'carlossg'
+    APP_NAME = 'go-demo-3'
+    CHARTMUSEUM_CREDS = credentials('jenkins-x-chartmuseum')
+  }
+  stages {
+    stage('CI Build and push snapshot') {
+      when {
+        branch 'PR-*'
       }
-      node("docker") { // Not allowed with declarative
-        checkout scm
-        k8sBuildImageBeta(props.image)
+      environment {
+        PREVIEW_VERSION = "0.0.0-SNAPSHOT-$BRANCH_NAME-$BUILD_NUMBER"
+        PREVIEW_NAMESPACE = "$APP_NAME-$BRANCH_NAME".toLowerCase()
+        HELM_RELEASE = "$PREVIEW_NAMESPACE".toLowerCase()
       }
-    }
-    stage("func-test") {
-      try {
-        container("helm") {
+      steps {
+        dir('/home/jenkins/go/src/github.com/carlossg/go-demo-3') {
           checkout scm
-          k8sUpgradeBeta(props.project, props.domain, "--set replicaCount=2 --set dbReplicaCount=1")
+          sh "make linux"
+          sh "export VERSION=$PREVIEW_VERSION && skaffold build -f skaffold.yaml"
+          sh "jx step post build --image $DOCKER_REGISTRY/$ORG/$APP_NAME:$PREVIEW_VERSION"
         }
-        container("kubectl") {
-          k8sRolloutBeta(props.project)
-        }
-        container("golang") {
-          k8sFuncTestGolang(props.project, props.domain)
-        }
-      } catch(e) {
-          error "Failed functional tests"
-      } finally {
-        container("helm") {
-          k8sDeleteBeta(props.project)
+        dir('/home/jenkins/go/src/github.com/carlossg/go-demo-3/charts/preview') {
+          sh "make preview"
+          sh "jx preview --app $APP_NAME --dir ../.."
         }
       }
     }
-    if ("${BRANCH_NAME}" == "master") {
-      stage("release") {
-        node("docker") {
-          k8sPushImage(props.image)
-        }
-        container("helm") {
-          k8sPushHelm(props.project, props.chartVer, props.cmAddr)
+    stage('Build Release') {
+      when {
+        branch 'master'
+      }
+      steps {
+        dir('/home/jenkins/go/src/github.com/carlossg/go-demo-3') {
+          git 'https://github.com/carlossg/go-demo-3.git'
+
+          // so we can retrieve the version in later steps
+          sh "echo \$(jx-release-version) > VERSION"
+          sh "jx step tag --version \$(cat VERSION)"
+          sh "make build"
+          sh "export VERSION=`cat VERSION` && skaffold build -f skaffold.yaml"
+          sh "jx step post build --image $DOCKER_REGISTRY/$ORG/$APP_NAME:\$(cat VERSION)"
         }
       }
-      stage("deploy") {
-        try {
-          container("helm") {
-            k8sUpgrade(props.project, props.addr)
-          }
-          container("kubectl") {
-            k8sRollout(props.project)
-          }
-          container("golang") {
-            k8sProdTestGolang(props.addr)
-          }
-        } catch(e) {
-          container("helm") {
-            k8sRollback(props.project)
-          }
+    }
+    stage('Promote to Environments') {
+      when {
+        branch 'master'
+      }
+      steps {
+        dir('/home/jenkins/go/src/github.com/carlossg/go-demo-3/charts/go-demo-3') {
+          sh "jx step changelog --version v\$(cat ../../VERSION)"
+
+          // release the helm chart
+          sh "jx step helm release"
+
+          // promote through all 'Auto' promotion Environments
+          sh "jx promote -b --all-auto --timeout 1h --version \$(cat ../../VERSION)"
         }
       }
     }
